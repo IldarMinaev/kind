@@ -154,6 +154,10 @@ Environment='HTTP_PROXY='
 Environment='HTTPS_PROXY='
 Environment='http_proxy='
 Environment='https_proxy='
+Environment='ALL_PROXY='
+Environment='all_proxy='
+Environment='FTP_PROXY='
+Environment='ftp_proxy='
 UNIT
 
     # ── 2. Write hosts.toml mirrors for docker.io ─────────────────────────────
