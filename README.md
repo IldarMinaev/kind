@@ -108,6 +108,9 @@ Access: `https://my-app.localhost.localdomain`
 
 ### Istio Gateway + VirtualService
 
+`setup.sh` creates a wildcard TLS certificate (`istio-system/istio-gw-tls`) that all
+Gateways can share via `credentialName`.
+
 ```yaml
 apiVersion: networking.istio.io/v1alpha3
 kind: Gateway
@@ -117,22 +120,29 @@ spec:
   selector:
     istio: ingressgateway
   servers:
+    # HTTP
     - port:
         number: 80
         name: http
         protocol: HTTP
-      hosts:
-        - "my-app.localhost.localdomain"
+      hosts: ["my-app.localhost.localdomain"]
+    # HTTPS — uses the shared wildcard cert from setup.sh
+    - port:
+        number: 443
+        name: https
+        protocol: HTTPS
+      tls:
+        mode: SIMPLE
+        credentialName: istio-gw-tls   # secret in istio-system
+      hosts: ["my-app.localhost.localdomain"]
 ---
 apiVersion: networking.istio.io/v1alpha3
 kind: VirtualService
 metadata:
   name: my-app
 spec:
-  hosts:
-    - "my-app.localhost.localdomain"
-  gateways:
-    - my-gateway
+  hosts: ["my-app.localhost.localdomain"]
+  gateways: [my-gateway]
   http:
     - route:
         - destination:
@@ -141,10 +151,12 @@ spec:
               number: 80
 ```
 
-Access: `http://my-app.localhost.localdomain:8080`
+Access:
+- HTTP:  `http://my-app.localhost.localdomain:8080`
+- HTTPS: `https://my-app.localhost.localdomain:8443`
 
-For HTTPS on the Istio gateway, configure the Gateway server with `protocol: HTTPS`
-and provide a TLS secret (cert-manager can provision it with `local-ca-issuer`).
+> **Per-service certs**: create a `cert-manager.io/v1 Certificate` in `istio-system`
+> with `secretName: my-app-tls` and reference it as `credentialName: my-app-tls`.
 
 ---
 
@@ -191,6 +203,74 @@ kind delete cluster --name local-dev
 
 # Optional — removes all persistent data
 sudo rm -rf /var/local-path-provisioner
+```
+
+---
+
+## Loading local Docker images into kind
+
+kind nodes run inside Docker containers and cannot access images from the host
+Docker daemon directly.  There are two approaches — a **local registry** (recommended)
+and **`kind load`** (simpler, no registry needed).
+
+---
+
+### Local registry
+
+`setup.sh` starts a `registry:2` container named `kind-registry` and connects
+it to the `kind` Docker network.  Containerd on every node is configured to
+resolve `localhost:5001` → `http://kind-registry:5000`, so pod specs can use
+`image: localhost:5001/<name>:<tag>` and the image is pulled from the local
+registry automatically — no `kind load` needed.
+
+**Advantages:**
+- Push once — all nodes pull from the registry; no per-node copying
+- Survives node restarts — nodes re-pull from the registry
+- Works exactly like a real registry
+
+#### Workflow
+
+Use `kbuild` — it builds and pushes to the local registry in a single command,
+with no separate `docker tag` or `docker push` step:
+
+```bash
+# Build and push in one step
+./kbuild inventory-service:latest ./inventory
+
+# With extra build args or a custom Dockerfile
+./kbuild inventory-service:latest --build-arg ENV=dev ./inventory
+./kbuild inventory-service:latest --file ./inventory/Dockerfile.prod ./inventory
+
+# After a rebuild (same tag), restart the deployment to force a re-pull
+kubectl rollout restart deployment/inventory-service -n inventory
+```
+
+Reference the image in your pod spec using the registry address:
+```
+image: localhost:5001/inventory-service:latest
+```
+
+#### Pod spec example
+
+```yaml
+spec:
+  containers:
+    - name: inventory-service
+      image: localhost:5001/inventory-service:latest
+      imagePullPolicy: Always   # always re-pull on pod restart
+```
+
+> Set `imagePullPolicy: Always` when using mutable tags like `latest` so a
+> `kubectl rollout restart` reliably picks up a freshly pushed image.
+
+#### Verify registry contents
+
+```bash
+# List repositories in the local registry
+curl -s http://localhost:5001/v2/_catalog | jq
+
+# List tags for a specific image
+curl -s http://localhost:5001/v2/inventory-service/tags/list | jq
 ```
 
 ---
@@ -247,4 +327,5 @@ docker exec local-dev-control-plane \
 | DNS not resolving | Check `systemd-resolved` isn't overriding: `resolvectl status` |
 | Istio pods pending | Ensure worker nodes have enough resources (4 CPU / 8 GB RAM recommended) |
 | TLS cert not issued | `kubectl describe certificaterequest -A` and check cert-manager logs |
-| ImagePullBackOff | Add/update mirrors in `kind-config.yaml`, then `./setup.sh --recreate` |
+| ImagePullBackOff (public image) | Add/update mirrors in `kind-config.yaml`, then `./setup.sh --recreate` |
+| ImagePullBackOff (local image) | `./kbuild <image>:<tag> <context>`, use `localhost:5001/…` in pod spec |

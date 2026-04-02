@@ -6,6 +6,7 @@
 #   - cert-manager with a self-signed ClusterIssuer
 #   - local-path-provisioner for persistent host storage
 #   - DNS wildcard *.localhost.localdomain → 127.0.0.1 via NetworkManager/dnsmasq
+#   - local Docker registry  (localhost:5001, accessible as kind-registry:5000)
 #
 # Usage:
 #   ./setup.sh             — create cluster (skip if exists) + install/upgrade all components
@@ -17,6 +18,8 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 KIND_CONFIG="${SCRIPT_DIR}/kind-config.yaml"
 
 CLUSTER_NAME="local-dev"
+LOCAL_REGISTRY_NAME="kind-registry"
+LOCAL_REGISTRY_PORT="5001"   # port on the host; inside kind nodes use kind-registry:5000
 ISTIO_VERSION="1.23.3"
 CERT_MANAGER_VERSION="v1.16.2"
 STORAGE_ROOT="/var/local-path-provisioner"
@@ -123,6 +126,69 @@ fi
 
 kubectl config use-context "kind-${CLUSTER_NAME}"
 
+# ── Local Docker registry ──────────────────────────────────────────────────
+#
+# Run a registry:2 container on the kind Docker network so all cluster nodes
+# can pull images from it as  kind-registry:5000/<image>:<tag>.
+# From the host, push images to  localhost:${LOCAL_REGISTRY_PORT}/<image>:<tag>.
+# Containerd on each node maps  localhost:${LOCAL_REGISTRY_PORT}  →
+#   http://kind-registry:5000  (see configure_mirrors below) so pod specs
+# can simply use  image: localhost:${LOCAL_REGISTRY_PORT}/<image>:<tag>.
+
+start_local_registry() {
+  if docker inspect "${LOCAL_REGISTRY_NAME}" &>/dev/null; then
+    local state
+    state=$(docker inspect -f '{{.State.Running}}' "${LOCAL_REGISTRY_NAME}")
+    if [[ "${state}" == "true" ]]; then
+      ok "Local registry '${LOCAL_REGISTRY_NAME}' already running (localhost:${LOCAL_REGISTRY_PORT})"
+      return
+    else
+      docker start "${LOCAL_REGISTRY_NAME}" >/dev/null
+      ok "Local registry '${LOCAL_REGISTRY_NAME}' started (was stopped)"
+      return
+    fi
+  fi
+
+  docker run -d \
+    --name "${LOCAL_REGISTRY_NAME}" \
+    --restart=always \
+    -p "127.0.0.1:${LOCAL_REGISTRY_PORT}:5000" \
+    registry:2 >/dev/null
+  ok "Local registry '${LOCAL_REGISTRY_NAME}' started → localhost:${LOCAL_REGISTRY_PORT}"
+}
+
+connect_registry_to_kind_network() {
+  # Attach the registry container to the kind Docker network so nodes can
+  # resolve it by name as 'kind-registry'.
+  if docker network inspect kind \
+       --format '{{range .Containers}}{{.Name}} {{end}}' \
+     | grep -qw "${LOCAL_REGISTRY_NAME}"; then
+    ok "Registry already connected to 'kind' network"
+  else
+    docker network connect kind "${LOCAL_REGISTRY_NAME}"
+    ok "Registry connected to 'kind' network"
+  fi
+}
+
+log "Starting local Docker registry"
+start_local_registry
+connect_registry_to_kind_network
+
+# Advertise the registry via the KEP-1755 standard ConfigMap so tools like
+# Tilt and Skaffold can discover it automatically.
+kubectl apply -f - >/dev/null <<EOF
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: local-registry-hosting
+  namespace: kube-public
+data:
+  localRegistryHosting.v1: |
+    host: "localhost:${LOCAL_REGISTRY_PORT}"
+    help: "https://kind.sigs.k8s.io/docs/user/local-registry/"
+EOF
+ok "local-registry-hosting ConfigMap applied (kube-public/local-registry-hosting)"
+
 # ── Registry mirrors (containerd v2 hosts.toml) ────────────────────────────
 #
 # We configure mirrors by writing hosts.toml files into each node and
@@ -137,16 +203,12 @@ MIRRORS=(
 
 configure_mirrors() {
   local node="$1"
-  local mirrors_str
-  mirrors_str=$(printf '"%s"\n' "${MIRRORS[@]}" | paste -sd, -)
 
+  # ── 1. Clear the broken host-injected proxy from containerd ─────────────────
+  # Docker daemon injects HTTP_PROXY/HTTPS_PROXY into containers, but
+  # 127.0.0.1 inside a container is the container itself (not the host proxy).
+  # Override containerd's systemd unit to explicitly unset those variables.
   docker exec "${node}" bash -c "
-    set -e
-
-    # ── 1. Clear the broken host-injected proxy from containerd ───────────────
-    # Docker daemon injects HTTP_PROXY/HTTPS_PROXY into containers, but
-    # 127.0.0.1 inside a container is the container itself (not the host proxy).
-    # Override containerd's systemd unit to explicitly unset those variables.
     mkdir -p /etc/systemd/system/containerd.service.d
     cat > /etc/systemd/system/containerd.service.d/no-proxy.conf <<'UNIT'
 [Service]
@@ -159,19 +221,23 @@ Environment='all_proxy='
 Environment='FTP_PROXY='
 Environment='ftp_proxy='
 UNIT
+  " 2>&1 | sed "s/^/  [${node}] /"
 
-    # ── 2. Write hosts.toml mirrors for docker.io ─────────────────────────────
-    mkdir -p /etc/containerd/certs.d/docker.io
-    cat > /etc/containerd/certs.d/docker.io/hosts.toml <<TOML
-server = \"https://registry-1.docker.io\"
-$(for m in ${MIRRORS[*]}; do
-  printf '[host.\"%s\"]\n  capabilities = [\"pull\", \"resolve\"]\n\n' "\${m}"
-done)
-TOML
+  # ── 2. Write hosts.toml for docker.io (pre-generated on host) ───────────────
+  # Build the TOML content here to avoid quoting issues inside docker exec "..."
+  local dockerio_toml
+  dockerio_toml='server = "https://registry-1.docker.io"'$'\n'
+  for m in "${MIRRORS[@]}"; do
+    dockerio_toml+='[host."'"${m}"'"]'$'\n'
+    dockerio_toml+='  capabilities = ["pull", "resolve"]'$'\n\n'
+  done
+  printf '%s' "${dockerio_toml}" | docker exec -i "${node}" bash -c \
+    'mkdir -p /etc/containerd/certs.d/docker.io && cat > /etc/containerd/certs.d/docker.io/hosts.toml' \
+    2>&1 | sed "s/^/  [${node}] /"
 
-    # ── 3. Point containerd at the certs.d directory (idempotent) ────────────
+  # ── 3. Point containerd at the certs.d directory (idempotent) ───────────────
+  docker exec "${node}" bash -c "
     if ! grep -q 'config_path' /etc/containerd/config.toml 2>/dev/null; then
-      # Append a snippet that enables the hosts directory
       cat >> /etc/containerd/config.toml <<'CONF'
 
 # Added by setup.sh — enable certs.d mirrors
@@ -179,8 +245,22 @@ TOML
   config_path = '/etc/containerd/certs.d'
 CONF
     fi
+  " 2>&1 | sed "s/^/  [${node}] /"
 
-    # ── 4. Reload and restart containerd ─────────────────────────────────────
+  # ── 4. Configure local registry mirror ──────────────────────────────────────
+  # Pod specs use  localhost:${LOCAL_REGISTRY_PORT}/image:tag
+  # Inside the node localhost:${LOCAL_REGISTRY_PORT} doesn't reach the host,
+  # so we redirect that address to the registry container on the kind network.
+  # Build content on the host to avoid double-quote stripping inside "..." strings.
+  local registry_toml
+  registry_toml='[host."http://'"${LOCAL_REGISTRY_NAME}"':5000"]'$'\n'
+  registry_toml+='  capabilities = ["pull", "resolve"]'$'\n'
+  printf '%s' "${registry_toml}" | docker exec -i "${node}" bash -c \
+    "mkdir -p /etc/containerd/certs.d/localhost:${LOCAL_REGISTRY_PORT} && cat > /etc/containerd/certs.d/localhost:${LOCAL_REGISTRY_PORT}/hosts.toml" \
+    2>&1 | sed "s/^/  [${node}] /"
+
+  # ── 5. Reload and restart containerd ────────────────────────────────────────
+  docker exec "${node}" bash -c "
     systemctl daemon-reload
     systemctl restart containerd
     sleep 2
@@ -341,6 +421,42 @@ kubectl patch svc istio-ingressgateway -n istio-system --type=json -p='[
 
 ok "Istio ingress gateway → NodePort 30080 (HTTP) / 30443 (HTTPS)"
 
+# ── Wildcard TLS cert for Istio gateway ───────────────────────────────────
+#
+# For HTTPS Gateways the TLS secret must live in istio-system (where the
+# gateway pod runs). We provision a wildcard cert once; per-service Gateways
+# can reference it via  spec.servers[].tls.credentialName: istio-gw-tls
+# (or create their own certs in istio-system using the same pattern).
+
+log "Creating wildcard TLS cert for Istio gateway (istio-system)"
+
+kubectl apply -f - <<'EOF'
+apiVersion: cert-manager.io/v1
+kind: Certificate
+metadata:
+  name: istio-gw-tls
+  namespace: istio-system
+spec:
+  secretName: istio-gw-tls
+  commonName: "*.localhost.localdomain"
+  dnsNames:
+    - "*.localhost.localdomain"
+    - "localhost.localdomain"
+  issuerRef:
+    name: local-ca-issuer
+    kind: ClusterIssuer
+    group: cert-manager.io
+EOF
+
+echo "  Waiting for istio-gw-tls secret..."
+for i in $(seq 1 30); do
+  if kubectl get secret istio-gw-tls -n istio-system &>/dev/null; then
+    ok "Wildcard TLS cert ready (secret: istio-system/istio-gw-tls)"
+    break
+  fi
+  sleep 2
+done
+
 # ── Verify ────────────────────────────────────────────────────────────────
 
 log "Verifying cluster components"
@@ -392,6 +508,10 @@ cat <<SUMMARY
     HTTP   →  http://<name>.localhost.localdomain:8080
     HTTPS  →  https://<name>.localhost.localdomain:8443
 
+  Local registry (push once, all nodes pull):
+    Build : ./kbuild <image>:<tag> <context_path>
+    In pod: image: localhost:${LOCAL_REGISTRY_PORT}/<image>:<tag>
+
   Storage:
     StorageClass : local-path (default)
     Host path    : ${STORAGE_ROOT}
@@ -399,6 +519,10 @@ cat <<SUMMARY
   Re-run modes:
     ./setup.sh             — upgrade components in-place
     ./setup.sh --recreate  — delete + recreate cluster (keeps host storage)
+
+  Local images — build and push in one step:
+    ./kbuild my-service:latest .
+    # In pod spec: image: localhost:${LOCAL_REGISTRY_PORT}/my-service:latest
 
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 SUMMARY

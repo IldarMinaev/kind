@@ -7,8 +7,9 @@
 #   2. nginx ingress HTTP → HTTPS redirect
 #   3. nginx ingress HTTPS with cert-manager TLS
 #   4. Istio ingress gateway HTTP
-#   5. PersistentVolumeClaim provisioning (local-path)
-#   6. Istio sidecar injection
+#   5. Istio ingress gateway HTTPS (port 8443)
+#   6. PersistentVolumeClaim provisioning (local-path)
+#   7. Istio sidecar injection
 #
 # Run:
 #   ./smoke-test.sh
@@ -119,7 +120,8 @@ spec:
                 port:
                   number: 80
 ---
-# Istio Gateway
+# Istio Gateway — HTTP + HTTPS
+# The HTTPS server uses the wildcard cert provisioned by setup.sh in istio-system.
 apiVersion: networking.istio.io/v1alpha3
 kind: Gateway
 metadata:
@@ -132,6 +134,14 @@ spec:
         number: 80
         name: http
         protocol: HTTP
+      hosts: [echo-istio.localhost.localdomain]
+    - port:
+        number: 443
+        name: https
+        protocol: HTTPS
+      tls:
+        mode: SIMPLE
+        credentialName: istio-gw-tls
       hosts: [echo-istio.localhost.localdomain]
 ---
 apiVersion: networking.istio.io/v1alpha3
@@ -225,9 +235,32 @@ else
   fail "Istio gateway body unexpected: '${ISTIO_BODY}'"
 fi
 
-# ── 5. PVC provisioning ────────────────────────────────────────────────────
+# ── 5. Istio ingress gateway — HTTPS (port 8443) ──────────────────────────
 
-log "5. PersistentVolumeClaim — local-path provisioner"
+log "5. Istio ingress gateway — HTTPS (port 8443)"
+
+# Wait for istio-gw-tls secret to exist in istio-system
+if wait_for "istio-gw-tls secret" "kubectl get secret istio-gw-tls -n istio-system"; then
+  # Retry: gateway needs a moment to reload TLS config
+  ISTIO_HTTPS_BODY=""
+  for i in $(seq 1 20); do
+    ISTIO_HTTPS_BODY=$(kcurl -sk -4 https://echo-istio.localhost.localdomain:8443/ 2>/dev/null || echo "")
+    [[ "${ISTIO_HTTPS_BODY}" == *"hello-from-kind"* ]] && break
+    sleep 2
+  done
+
+  if [[ "${ISTIO_HTTPS_BODY}" == *"hello-from-kind"* ]]; then
+    pass "Istio gateway HTTPS → 'hello-from-kind'"
+  else
+    fail "Istio gateway HTTPS body unexpected: '${ISTIO_HTTPS_BODY}'"
+  fi
+else
+  fail "istio-gw-tls secret not found in istio-system (run ./setup.sh first)"
+fi
+
+# ── 6. PVC provisioning ────────────────────────────────────────────────────
+
+log "6. PersistentVolumeClaim — local-path provisioner"
 
 # Bind a PVC by creating a pod that uses it
 kubectl apply -n "${NS}" -f - >/dev/null <<'EOF'
@@ -271,9 +304,9 @@ else
   fail "PVC not bound after 60s (status: ${PVC_STATUS})"
 fi
 
-# ── 6. Istio sidecar injection ─────────────────────────────────────────────
+# ── 7. Istio sidecar injection ─────────────────────────────────────────────
 
-log "6. Istio sidecar injection"
+log "7. Istio sidecar injection"
 
 # Istio 1.23+ uses native sidecar (initContainer with restartPolicy:Always)
 # on Kubernetes 1.28+; check both containers and initContainers.

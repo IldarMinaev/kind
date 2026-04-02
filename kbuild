@@ -1,0 +1,38 @@
+#!/usr/bin/env bash
+# ---------------------------------------------------------------------------
+# kbuild — Build a Docker image and push it directly to the kind local registry
+#          in a single command. No separate docker tag or docker push needed.
+#
+# Usage:
+#   ./kbuild <name>:<tag> [BUILD_ARGS...] <context_path>
+#
+# Examples:
+#   ./kbuild inventory-service:latest .
+#   ./kbuild my-svc:v1.2 --build-arg ENV=dev ./services/my-svc
+#   ./kbuild api:latest --file ./docker/Dockerfile .
+#
+# The image is pushed to localhost:5001/<name>:<tag> and is immediately
+# available in all kind nodes as:  image: localhost:5001/<name>:<tag>
+# ---------------------------------------------------------------------------
+set -euo pipefail
+
+REGISTRY="localhost:5001"
+
+if [[ $# -lt 2 ]]; then
+  echo "Usage: kbuild <name>:<tag> [docker buildx build args...] <context_path>" >&2
+  exit 1
+fi
+
+IMAGE="$1"; shift
+DEST="${REGISTRY}/${IMAGE}"
+
+# Verify the local registry is reachable before attempting the build
+if ! curl -sf "http://${REGISTRY}/v2/" &>/dev/null; then
+  echo "error: local registry not reachable at http://${REGISTRY}" >&2
+  echo "       Run ./setup.sh to start it." >&2
+  exit 1
+fi
+
+echo "Building and pushing → ${DEST}"
+docker buildx build --push -t "${DEST}" "$@"
+echo "Done: ${DEST}"
