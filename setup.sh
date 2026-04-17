@@ -325,6 +325,8 @@ helm upgrade --install ingress-nginx ingress-nginx/ingress-nginx \
   --set "controller.tolerations[0].key=node-role.kubernetes.io/control-plane" \
   --set "controller.tolerations[0].operator=Exists" \
   --set "controller.tolerations[0].effect=NoSchedule" \
+  --set controller.metrics.enabled=true \
+  --set controller.metrics.serviceMonitor.enabled=true \
   --wait --timeout 5m
 
 ok "nginx ingress controller installed"
