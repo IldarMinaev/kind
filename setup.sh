@@ -308,6 +308,8 @@ fi
 ok "local-path-provisioner configured (storage root: ${STORAGE_ROOT})"
 
 # ── nginx ingress controller ───────────────────────────────────────────────
+log "Installing ServiceMonitor CRD"
+kubectl apply -f https://github.com/Netcracker/qubership-monitoring-operator/raw/refs/heads/main/charts/qubership-monitoring-crds/crds/monitoring.coreos.com_servicemonitors.yaml
 
 log "Installing nginx ingress controller (ports 80/443)"
 
