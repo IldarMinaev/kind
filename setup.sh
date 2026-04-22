@@ -1,8 +1,9 @@
 #!/usr/bin/env bash
 # ---------------------------------------------------------------------------
 # setup.sh — Create / update / recreate a local kind Kubernetes cluster with:
-#   - nginx ingress controller  (host ports 80/443)
-#   - Istio service mesh + ingress gateway (host ports 8080/8443)
+#   - Istio service mesh + ingress gateway (host ports 80/443)
+#     handles both Kubernetes Gateway API (HTTPRoute) and classic Ingress resources
+#     (set ingressClassName: istio on Ingress objects)
 #   - cert-manager with a self-signed ClusterIssuer
 #   - local-path-provisioner for persistent host storage
 #   - DNS wildcard *.localhost.localdomain → 127.0.0.1 via NetworkManager/dnsmasq
@@ -21,6 +22,7 @@ CLUSTER_NAME="local-dev"
 LOCAL_REGISTRY_NAME="kind-registry"
 LOCAL_REGISTRY_PORT="5001"   # port on the host; inside kind nodes use kind-registry:5000
 ISTIO_VERSION="1.23.3"
+GATEWAY_API_VERSION="v1.2.1"
 CERT_MANAGER_VERSION="v1.16.2"
 STORAGE_ROOT="/var/local-path-provisioner"
 
@@ -311,28 +313,6 @@ ok "local-path-provisioner configured (storage root: ${STORAGE_ROOT})"
 log "Installing ServiceMonitor CRD"
 kubectl apply -f https://github.com/Netcracker/qubership-monitoring-operator/raw/refs/heads/main/charts/qubership-monitoring-crds/crds/monitoring.coreos.com_servicemonitors.yaml
 
-log "Installing nginx ingress controller (ports 80/443)"
-
-helm repo add ingress-nginx https://kubernetes.github.io/ingress-nginx --force-update 2>/dev/null || true
-helm repo update ingress-nginx
-
-helm upgrade --install ingress-nginx ingress-nginx/ingress-nginx \
-  --namespace ingress-nginx \
-  --create-namespace \
-  --set controller.hostPort.enabled=true \
-  --set controller.hostPort.ports.http=80 \
-  --set controller.hostPort.ports.https=443 \
-  --set controller.service.type=ClusterIP \
-  --set-string "controller.nodeSelector.ingress-ready=true" \
-  --set "controller.tolerations[0].key=node-role.kubernetes.io/control-plane" \
-  --set "controller.tolerations[0].operator=Exists" \
-  --set "controller.tolerations[0].effect=NoSchedule" \
-  --set controller.metrics.enabled=true \
-  --set controller.metrics.serviceMonitor.enabled=true \
-  --wait --timeout 5m
-
-ok "nginx ingress controller installed"
-
 # ── cert-manager ───────────────────────────────────────────────────────────
 
 log "Installing cert-manager ${CERT_MANAGER_VERSION}"
@@ -398,32 +378,54 @@ for i in $(seq 1 30); do
   sleep 2
 done
 
+# ── Kubernetes Gateway API CRDs ────────────────────────────────────────────
+#
+# Must be installed before Istio so Istio's Gateway API controller can
+# register watches on these resource types at startup.
+
+log "Installing Kubernetes Gateway API CRDs ${GATEWAY_API_VERSION}"
+
+kubectl apply -f "https://github.com/kubernetes-sigs/gateway-api/releases/download/${GATEWAY_API_VERSION}/standard-install.yaml"
+
+ok "Gateway API CRDs installed"
+
 # ── Istio ──────────────────────────────────────────────────────────────────
 
 log "Installing Istio ${ISTIO_VERSION} (demo profile)"
 
-"${ISTIOCTL}" install --set profile=demo --skip-confirmation
+# Enable Ingress controller so Istio handles classic Ingress resources with
+# ingressClassName: istio (or the legacy kubernetes.io/ingress.class: istio annotation).
+# ingressControllerMode DEFAULT means Istio only claims Ingresses that explicitly
+# select it; other Ingresses (no class / other class) are left alone.
+"${ISTIOCTL}" install --set profile=demo --skip-confirmation \
+  --set 'meshConfig.ingressClass=istio' \
+  --set 'meshConfig.ingressControllerMode=DEFAULT' \
+  --set 'meshConfig.ingressService=istio-ingressgateway'
 
 kubectl label namespace default istio-injection=enabled --overwrite
 
 ok "Istio control plane installed"
 
-# ── Istio ingress gateway NodePorts ───────────────────────────────────────
+# Register an IngressClass so that spec.ingressClassName: istio works (Kubernetes
+# 1.18+ style). The legacy annotation kubernetes.io/ingress.class: istio still
+# works too (handled by meshConfig.ingressClass above).
+kubectl apply -f - <<'EOF'
+apiVersion: networking.k8s.io/v1
+kind: IngressClass
+metadata:
+  name: istio
+spec:
+  controller: istio.io/ingress-controller
+EOF
+ok "IngressClass 'istio' registered"
 
-log "Configuring Istio ingress gateway NodePorts (30080→8080, 30443→8443)"
-
-# The demo profile creates the service with LoadBalancer type and existing ports.
-# We replace the port list entirely with the ports we need + fixed NodePorts.
-kubectl patch svc istio-ingressgateway -n istio-system --type=json -p='[
-  {"op":"replace","path":"/spec/type","value":"NodePort"},
-  {"op":"replace","path":"/spec/ports","value":[
-    {"name":"status-port","port":15021,"targetPort":15021,"protocol":"TCP"},
-    {"name":"http2",      "port":80,   "targetPort":8080, "nodePort":30080,"protocol":"TCP"},
-    {"name":"https",      "port":443,  "targetPort":8443, "nodePort":30443,"protocol":"TCP"}
-  ]}
-]'
-
-ok "Istio ingress gateway → NodePort 30080 (HTTP) / 30443 (HTTPS)"
+# ── Istio ingress gateway ─────────────────────────────────────────────────
+#
+# The Gateway API deployment controller (enabled by default) will create a
+# dedicated 'gateway-istio' Deployment + Service in the gateway-infra namespace
+# when we apply the Gateway resource below.  We leave istio-ingressgateway
+# untouched (LoadBalancer type, used only for classic Ingress and Istio-native
+# Gateway+VirtualService patterns inside the cluster).
 
 # ── Wildcard TLS cert for Istio gateway ───────────────────────────────────
 #
@@ -461,6 +463,115 @@ for i in $(seq 1 30); do
   sleep 2
 done
 
+# ── Kubernetes Gateway API: shared Gateway resource ───────────────────────
+#
+# Creates a single shared Gateway in the 'gateway-infra' namespace that all
+# HTTPRoute resources (from any namespace) can attach to via parentRefs.
+# The TLS secret lives in gateway-infra — Istio reads it from there when
+# serving HTTPS for attached HTTPRoutes.
+
+log "Creating Gateway infrastructure (namespace: gateway-infra)"
+
+kubectl create namespace gateway-infra --dry-run=client -o yaml | kubectl apply -f -
+
+# Wildcard TLS cert in gateway-infra (Istio reads secrets from the Gateway's namespace)
+kubectl apply -f - <<'EOF'
+apiVersion: cert-manager.io/v1
+kind: Certificate
+metadata:
+  name: gateway-wildcard-tls
+  namespace: gateway-infra
+spec:
+  secretName: gateway-wildcard-tls
+  commonName: "*.localhost.localdomain"
+  dnsNames:
+    - "*.localhost.localdomain"
+    - "localhost.localdomain"
+  issuerRef:
+    name: local-ca-issuer
+    kind: ClusterIssuer
+    group: cert-manager.io
+EOF
+
+echo "  Waiting for gateway-wildcard-tls secret..."
+for i in $(seq 1 30); do
+  if kubectl get secret gateway-wildcard-tls -n gateway-infra &>/dev/null; then
+    ok "Wildcard TLS cert ready (secret: gateway-infra/gateway-wildcard-tls)"
+    break
+  fi
+  sleep 2
+done
+
+# Wait for GatewayClass 'istio' — Istio registers it after the CRDs are present
+echo "  Waiting for GatewayClass 'istio'..."
+for i in $(seq 1 30); do
+  if kubectl get gatewayclass istio &>/dev/null 2>&1; then
+    ok "GatewayClass 'istio' is available"
+    break
+  fi
+  sleep 2
+done
+
+kubectl apply -f - <<'EOF'
+apiVersion: gateway.networking.k8s.io/v1
+kind: Gateway
+metadata:
+  name: gateway
+  namespace: gateway-infra
+spec:
+  gatewayClassName: istio
+  listeners:
+    - name: https
+      protocol: HTTPS
+      port: 443
+      tls:
+        mode: Terminate
+        certificateRefs:
+          - name: gateway-wildcard-tls
+            namespace: gateway-infra
+      allowedRoutes:
+        namespaces:
+          from: All
+    - name: http
+      protocol: HTTP
+      port: 80
+      allowedRoutes:
+        namespaces:
+          from: All
+EOF
+
+ok "Gateway 'gateway-infra/gateway' created (HTTPS :443, HTTP :80)"
+
+# ── Patch gateway-istio Service to fixed NodePorts ────────────────────────
+#
+# Istio's Gateway API deployment controller auto-creates 'gateway-istio'
+# Deployment + Service in gateway-infra after the Gateway resource is applied.
+# We patch the Service to use fixed NodePorts so kind's host port mappings
+# (kind-config.yaml: host:80→30080, host:443→30443) reach the right pods.
+
+log "Waiting for Istio to provision gateway-istio Service in gateway-infra"
+for i in $(seq 1 60); do
+  if kubectl get svc gateway-istio -n gateway-infra &>/dev/null; then
+    ok "Service gateway-istio found"
+    break
+  fi
+  if [[ "${i}" -eq 60 ]]; then
+    die "Timed out waiting for gateway-istio Service — check Istiod logs"
+  fi
+  sleep 3
+done
+
+log "Patching gateway-istio Service → NodePort 30080 (HTTP) / 30443 (HTTPS)"
+kubectl patch svc gateway-istio -n gateway-infra --type=json -p='[
+  {"op":"replace","path":"/spec/type","value":"NodePort"},
+  {"op":"replace","path":"/spec/ports","value":[
+    {"name":"status-port","port":15021,"targetPort":15021,"protocol":"TCP"},
+    {"name":"http",       "port":80,   "targetPort":80,   "nodePort":30080,"protocol":"TCP"},
+    {"name":"https",      "port":443,  "targetPort":443,  "nodePort":30443,"protocol":"TCP"}
+  ]}
+]'
+ok "gateway-istio → NodePort 30080 (HTTP→host:80) / 30443 (HTTPS→host:443)"
+
 # ── Verify ────────────────────────────────────────────────────────────────
 
 log "Verifying cluster components"
@@ -485,11 +596,11 @@ check_deployment() {
 }
 
 check_deployment local-path-storage   local-path-provisioner
-check_deployment ingress-nginx        ingress-nginx-controller
 check_deployment cert-manager         cert-manager
 check_deployment cert-manager         cert-manager-webhook
 check_deployment istio-system         istiod
 check_deployment istio-system         istio-ingressgateway
+check_deployment gateway-infra        gateway-istio
 
 echo
 kubectl get storageclass
@@ -503,14 +614,22 @@ cat <<SUMMARY
   Cluster '${CLUSTER_NAME}' is ready
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
-  nginx Ingress (standard Ingress resources):
-    HTTP   →  http://<name>.localhost.localdomain
-    HTTPS  →  https://<name>.localhost.localdomain   (port 443)
-    Annotation for TLS:  cert-manager.io/cluster-issuer: local-ca-issuer
+  All traffic enters via Istio ingressgateway on standard ports 80/443.
 
-  Istio Ingress Gateway (Gateway + VirtualService):
-    HTTP   →  http://<name>.localhost.localdomain:8080
-    HTTPS  →  https://<name>.localhost.localdomain:8443
+  Kubernetes Gateway API (HTTPRoute — new apps):
+    HTTP   →  http://<name>.localhost.localdomain
+    HTTPS  →  https://<name>.localhost.localdomain
+    parentRef: gateway-infra/gateway  (gatewayClassName: istio)
+
+  Classic Ingress (old apps — set ingressClassName: istio):
+    HTTP   →  http://<name>.localhost.localdomain
+    HTTPS  →  https://<name>.localhost.localdomain
+    TLS:       cert-manager.io/cluster-issuer: local-ca-issuer  annotation
+
+  Istio Gateway + VirtualService (Istio native):
+    HTTP   →  http://<name>.localhost.localdomain
+    HTTPS  →  https://<name>.localhost.localdomain
+    TLS credential: istio-gw-tls  (secret in istio-system)
 
   Local registry (push once, all nodes pull):
     Build : ./kbuild <image>:<tag> <context_path>

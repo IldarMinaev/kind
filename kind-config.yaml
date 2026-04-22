@@ -13,39 +13,32 @@ nodes:
     # Latest stable Kubernetes image — update the tag as new versions are released.
     # Browse available tags: https://hub.docker.com/r/kindest/node/tags
     image: kindest/node:v1.35.0
-    kubeadmConfigPatches:
-      - |
-        kind: InitConfiguration
-        nodeRegistration:
-          kubeletExtraArgs:
-            node-labels: "ingress-ready=true"
     extraPortMappings:
-      # nginx ingress controller — binds directly to node hostPorts
-      - containerPort: 80
+      # Istio ingress gateway — NodePort service (handles both Ingress and HTTPRoute)
+      - containerPort: 30080
         hostPort: 80
         protocol: TCP
-      - containerPort: 443
+      - containerPort: 30443
         hostPort: 443
         protocol: TCP
-      # Istio ingress gateway — NodePort service on these ports
-      - containerPort: 30080
-        hostPort: 8080
-        protocol: TCP
-      - containerPort: 30443
-        hostPort: 8443
-        protocol: TCP
     extraMounts:
       - hostPath: /var/local-path-provisioner
         containerPath: /var/local-path-provisioner
+      - hostPath: /var/run/docker.sock
+        containerPath: /var/run/docker.sock
 
   - role: worker
     image: kindest/node:v1.35.0
     extraMounts:
       - hostPath: /var/local-path-provisioner
         containerPath: /var/local-path-provisioner
+      - hostPath: /var/run/docker.sock
+        containerPath: /var/run/docker.sock
 
   - role: worker
     image: kindest/node:v1.35.0
     extraMounts:
       - hostPath: /var/local-path-provisioner
         containerPath: /var/local-path-provisioner
+      - hostPath: /var/run/docker.sock
+        containerPath: /var/run/docker.sock

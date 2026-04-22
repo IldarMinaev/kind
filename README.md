@@ -56,24 +56,60 @@ The script is idempotent — safe to re-run.
 Host machine (Fedora)
   *.localhost.localdomain → 127.0.0.1
        │
-       ├── :80 / :443  ──► kind node hostPort ──► nginx ingress controller
-       │                                           (Ingress resources)
-       │
-       └── :8080 / :8443 ─► kind node NodePort ──► Istio ingress gateway
-                             30080 / 30443          (Gateway + VirtualService)
+       └── :80 / :443  ──► kind node NodePort ──► Istio ingress gateway
+                            30080 / 30443          ├── HTTPRoute  (new apps, Gateway API)
+                                                   ├── Ingress    (old apps, ingressClassName: istio)
+                                                   └── Gateway + VirtualService (Istio native)
 ```
 
-| Entry point        | Port on host | Used for                          |
-|--------------------|--------------|-----------------------------------|
-| nginx ingress      | 80 / **443** | Standard `Ingress` resources      |
-| Istio gateway      | 8080 / 8443  | Istio `Gateway` + `VirtualService`|
-| Storage            | —            | `/var/local-path-provisioner`     |
+| Entry point        | Port on host  | Used for                                                        |
+|--------------------|---------------|-----------------------------------------------------------------|
+| Istio gateway      | 80 / **443**  | `HTTPRoute` · `Ingress` (className: istio) · `VirtualService`  |
+| Storage            | —             | `/var/local-path-provisioner`                                   |
+
+The shared Gateway resource lives in `gateway-infra/gateway` and accepts
+HTTPRoutes from **any namespace** on both HTTP (:80) and HTTPS (:443).
+
+Old apps using `Ingress` resources work on the same port 443 — just set
+`ingressClassName: istio` (or `kubernetes.io/ingress.class: istio` annotation).
 
 ---
 
 ## Usage examples
 
-### nginx Ingress with automatic TLS
+### Kubernetes Gateway API with HTTPRoute (recommended)
+
+`setup.sh` creates a shared `Gateway` in `gateway-infra` backed by Istio's
+ingressgateway on standard ports 80/443. HTTPRoutes from any namespace attach
+to it via `parentRefs`.
+
+```yaml
+apiVersion: gateway.networking.k8s.io/v1
+kind: HTTPRoute
+metadata:
+  name: my-app
+  namespace: my-namespace
+spec:
+  parentRefs:
+    - name: gateway
+      namespace: gateway-infra
+  hostnames:
+    - my-app.localhost.localdomain
+  rules:
+    - backendRefs:
+        - name: my-app-svc
+          port: 80
+```
+
+Access: `https://my-app.localhost.localdomain` (HTTPS terminated at the Gateway
+using the wildcard cert `gateway-infra/gateway-wildcard-tls`).
+
+---
+
+### Classic Ingress with automatic TLS (old apps)
+
+Use `ingressClassName: istio` instead of `nginx`. The TLS secret is created by
+cert-manager in the same namespace and Istio reads it automatically.
 
 ```yaml
 apiVersion: networking.k8s.io/v1
@@ -82,9 +118,8 @@ metadata:
   name: my-app
   annotations:
     cert-manager.io/cluster-issuer: local-ca-issuer
-    nginx.ingress.kubernetes.io/ssl-redirect: "true"
 spec:
-  ingressClassName: nginx
+  ingressClassName: istio
   tls:
     - hosts:
         - my-app.localhost.localdomain
@@ -106,7 +141,7 @@ Access: `https://my-app.localhost.localdomain`
 
 ---
 
-### Istio Gateway + VirtualService
+### Istio Gateway + VirtualService (Istio native)
 
 `setup.sh` creates a wildcard TLS certificate (`istio-system/istio-gw-tls`) that all
 Gateways can share via `credentialName`.
@@ -152,8 +187,8 @@ spec:
 ```
 
 Access:
-- HTTP:  `http://my-app.localhost.localdomain:8080`
-- HTTPS: `https://my-app.localhost.localdomain:8443`
+- HTTP:  `http://my-app.localhost.localdomain`
+- HTTPS: `https://my-app.localhost.localdomain`
 
 > **Per-service certs**: create a `cert-manager.io/v1 Certificate` in `istio-system`
 > with `secretName: my-app-tls` and reference it as `credentialName: my-app-tls`.
@@ -323,8 +358,9 @@ docker exec local-dev-control-plane \
 
 | Problem | Fix |
 |---------|-----|
-| Port 80/443 already in use | Stop any local nginx/Apache: `sudo systemctl stop nginx` |
+| Port 80/443 already in use | Another process (local nginx, etc.) is using it: `sudo ss -tlnp \| grep -E ':80\|:443'` |
 | DNS not resolving | Check `systemd-resolved` isn't overriding: `resolvectl status` |
+| Ingress not routing | Confirm `ingressClassName: istio` is set (not `nginx`) |
 | Istio pods pending | Ensure worker nodes have enough resources (4 CPU / 8 GB RAM recommended) |
 | TLS cert not issued | `kubectl describe certificaterequest -A` and check cert-manager logs |
 | ImagePullBackOff (public image) | Add/update mirrors in `kind-config.yaml`, then `./setup.sh --recreate` |
