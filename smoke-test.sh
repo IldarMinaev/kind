@@ -4,12 +4,10 @@
 #
 # Tests:
 #   1. DNS wildcard resolution
-#   2. nginx ingress HTTP → HTTPS redirect
-#   3. nginx ingress HTTPS with cert-manager TLS
-#   4. Istio ingress gateway HTTP
-#   5. Istio ingress gateway HTTPS (port 8443)
-#   6. PersistentVolumeClaim provisioning (local-path)
-#   7. Istio sidecar injection
+#   2. Gateway API HTTPRoute — HTTP  (port 80)
+#   3. Gateway API HTTPRoute — HTTPS (port 443, wildcard TLS)
+#   4. PersistentVolumeClaim provisioning (local-path)
+#   5. Istio sidecar injection
 #
 # Run:
 #   ./smoke-test.sh
@@ -60,7 +58,15 @@ if ! kubectl get namespace "${NS}" &>/dev/null; then
 fi
 kubectl label namespace "${NS}" istio-injection=enabled --overwrite >/dev/null
 
-# Ensure smoke resources are deployed
+# Ensure gateway-istio is running before testing routes
+if ! wait_for "gateway-istio deployment" \
+    "kubectl get deploy gateway-istio -n istio-system"; then
+  fail "gateway-istio deployment not found — run ./setup.sh first"
+  exit 1
+fi
+kubectl rollout status deployment/gateway-istio -n istio-system --timeout=3m >/dev/null
+
+# Deploy smoke resources
 kubectl apply -n "${NS}" -f - >/dev/null <<'EOF'
 # Echo server
 apiVersion: apps/v1
@@ -95,68 +101,21 @@ spec:
     - port: 80
       targetPort: 5678
 ---
-# nginx Ingress with TLS
-apiVersion: networking.k8s.io/v1
-kind: Ingress
+# Gateway API HTTPRoute — attaches to the shared gateway in istio-system
+apiVersion: gateway.networking.k8s.io/v1
+kind: HTTPRoute
 metadata:
   name: echo
-  annotations:
-    cert-manager.io/cluster-issuer: local-ca-issuer
-    nginx.ingress.kubernetes.io/ssl-redirect: "true"
 spec:
-  ingressClassName: nginx
-  tls:
-    - hosts: [echo.localhost.localdomain]
-      secretName: echo-tls
+  parentRefs:
+    - name: gateway
+      namespace: istio-system
+  hostnames:
+    - echo.localhost.localdomain
   rules:
-    - host: echo.localhost.localdomain
-      http:
-        paths:
-          - path: /
-            pathType: Prefix
-            backend:
-              service:
-                name: echo
-                port:
-                  number: 80
----
-# Istio Gateway — HTTP + HTTPS
-# The HTTPS server uses the wildcard cert provisioned by setup.sh in istio-system.
-apiVersion: networking.istio.io/v1alpha3
-kind: Gateway
-metadata:
-  name: echo-gw
-spec:
-  selector:
-    istio: ingressgateway
-  servers:
-    - port:
-        number: 80
-        name: http
-        protocol: HTTP
-      hosts: [echo-istio.localhost.localdomain]
-    - port:
-        number: 443
-        name: https
-        protocol: HTTPS
-      tls:
-        mode: SIMPLE
-        credentialName: istio-gw-tls
-      hosts: [echo-istio.localhost.localdomain]
----
-apiVersion: networking.istio.io/v1alpha3
-kind: VirtualService
-metadata:
-  name: echo
-spec:
-  hosts: [echo-istio.localhost.localdomain]
-  gateways: [echo-gw]
-  http:
-    - route:
-        - destination:
-            host: echo
-            port:
-              number: 80
+    - backendRefs:
+        - name: echo
+          port: 80
 ---
 # PVC
 apiVersion: v1
@@ -185,84 +144,57 @@ else
   fail "echo.localhost.localdomain did not resolve"
 fi
 
-# ── 2. nginx HTTP redirect ─────────────────────────────────────────────────
+# ── 2. Gateway API — HTTP ──────────────────────────────────────────────────
 
-log "2. nginx ingress — HTTP → HTTPS redirect (port 80)"
+log "2. Gateway API HTTPRoute — HTTP (port 80)"
 
-HTTP_STATUS=$(kcurl -so /dev/null -w '%{http_code}' -4 http://echo.localhost.localdomain/ 2>/dev/null || echo "000")
-if [[ "${HTTP_STATUS}" == "308" || "${HTTP_STATUS}" == "301" || "${HTTP_STATUS}" == "302" ]]; then
-  pass "HTTP redirect (${HTTP_STATUS})"
+HTTP_BODY=""
+for i in $(seq 1 30); do
+  HTTP_BODY=$(kcurl -s -4 --max-time 3 http://echo.localhost.localdomain/ 2>/dev/null || echo "")
+  [[ "${HTTP_BODY}" == *"hello-from-kind"* ]] && break
+  sleep 2
+done
+
+if [[ "${HTTP_BODY}" == *"hello-from-kind"* ]]; then
+  pass "HTTP → 'hello-from-kind'"
 else
-  fail "Expected 3xx redirect, got ${HTTP_STATUS}"
+  fail "HTTP body unexpected after retries: '${HTTP_BODY}'"
 fi
 
-# ── 3. nginx HTTPS ────────────────────────────────────────────────────────
+# ── 3. Gateway API — HTTPS ─────────────────────────────────────────────────
 
-log "3. nginx ingress — HTTPS (port 443)"
+log "3. Gateway API HTTPRoute — HTTPS (port 443, wildcard TLS)"
 
-# Wait for cert-manager to issue the TLS secret
-if wait_for "TLS secret issued" "kubectl get secret echo-tls -n ${NS}"; then
-  # Retry HTTPS: nginx may briefly return 503 while endpoint becomes active
-  HTTPS_BODY=""
-  for i in $(seq 1 20); do
-    HTTPS_BODY=$(kcurl -sk -4 https://echo.localhost.localdomain/ 2>/dev/null || echo "")
-    [[ "${HTTPS_BODY}" == *"hello-from-kind"* ]] && break
-    sleep 2
-  done
+# Wait for the HTTPRoute to be accepted by the Gateway
+ROUTE_STATUS=""
+for i in $(seq 1 30); do
+  ROUTE_STATUS=$(kubectl get httproute echo -n "${NS}" \
+    -o jsonpath='{.status.parents[0].conditions[?(@.type=="Accepted")].status}' 2>/dev/null || echo "")
+  [[ "${ROUTE_STATUS}" == "True" ]] && break
+  sleep 2
+done
+info "HTTPRoute accepted: ${ROUTE_STATUS:-unknown}"
 
-  if [[ "${HTTPS_BODY}" == *"hello-from-kind"* ]]; then
-    pass "HTTPS → 'hello-from-kind'"
-  else
-    fail "HTTPS body unexpected after retries: '${HTTPS_BODY}'"
-  fi
+HTTPS_BODY=""
+for i in $(seq 1 30); do
+  HTTPS_BODY=$(kcurl -sk -4 --max-time 3 https://echo.localhost.localdomain/ 2>/dev/null || echo "")
+  [[ "${HTTPS_BODY}" == *"hello-from-kind"* ]] && break
+  sleep 2
+done
 
-  # Check TLS cert details
+if [[ "${HTTPS_BODY}" == *"hello-from-kind"* ]]; then
   CERT_CN=$(kcurl -sk -4 -v https://echo.localhost.localdomain/ 2>&1 \
     | grep -i "subject:" | head -1 || true)
+  pass "HTTPS → 'hello-from-kind'"
   info "TLS: ${CERT_CN}"
 else
-  fail "TLS secret not issued within 60s"
+  fail "HTTPS body unexpected after retries: '${HTTPS_BODY}'"
 fi
 
-# ── 4. Istio ingress gateway ───────────────────────────────────────────────
+# ── 4. PVC provisioning ────────────────────────────────────────────────────
 
-log "4. Istio ingress gateway — HTTP (port 8080)"
+log "4. PersistentVolumeClaim — local-path provisioner"
 
-ISTIO_BODY=$(kcurl -s -4 http://echo-istio.localhost.localdomain:8080/ 2>/dev/null || echo "")
-if [[ "${ISTIO_BODY}" == *"hello-from-kind"* ]]; then
-  pass "Istio gateway → 'hello-from-kind'"
-else
-  fail "Istio gateway body unexpected: '${ISTIO_BODY}'"
-fi
-
-# ── 5. Istio ingress gateway — HTTPS (port 8443) ──────────────────────────
-
-log "5. Istio ingress gateway — HTTPS (port 8443)"
-
-# Wait for istio-gw-tls secret to exist in istio-system
-if wait_for "istio-gw-tls secret" "kubectl get secret istio-gw-tls -n istio-system"; then
-  # Retry: gateway needs a moment to reload TLS config
-  ISTIO_HTTPS_BODY=""
-  for i in $(seq 1 20); do
-    ISTIO_HTTPS_BODY=$(kcurl -sk -4 https://echo-istio.localhost.localdomain:8443/ 2>/dev/null || echo "")
-    [[ "${ISTIO_HTTPS_BODY}" == *"hello-from-kind"* ]] && break
-    sleep 2
-  done
-
-  if [[ "${ISTIO_HTTPS_BODY}" == *"hello-from-kind"* ]]; then
-    pass "Istio gateway HTTPS → 'hello-from-kind'"
-  else
-    fail "Istio gateway HTTPS body unexpected: '${ISTIO_HTTPS_BODY}'"
-  fi
-else
-  fail "istio-gw-tls secret not found in istio-system (run ./setup.sh first)"
-fi
-
-# ── 6. PVC provisioning ────────────────────────────────────────────────────
-
-log "6. PersistentVolumeClaim — local-path provisioner"
-
-# Bind a PVC by creating a pod that uses it
 kubectl apply -n "${NS}" -f - >/dev/null <<'EOF'
 apiVersion: v1
 kind: Pod
@@ -292,7 +224,6 @@ done
 
 if [[ "${PVC_STATUS}" == "Bound" ]]; then
   pass "PVC bound (local-path → /var/local-path-provisioner)"
-  # Wait for pod to complete
   kubectl wait pod/pvc-checker -n "${NS}" --for=condition=Ready --timeout=60s >/dev/null 2>&1 || true
   PVC_DATA=$(kubectl logs pvc-checker -n "${NS}" 2>/dev/null || echo "")
   if [[ "${PVC_DATA}" == *"kind-pvc-ok"* ]]; then
@@ -304,9 +235,9 @@ else
   fail "PVC not bound after 60s (status: ${PVC_STATUS})"
 fi
 
-# ── 7. Istio sidecar injection ─────────────────────────────────────────────
+# ── 5. Istio sidecar injection ─────────────────────────────────────────────
 
-log "7. Istio sidecar injection"
+log "5. Istio sidecar injection"
 
 # Istio 1.23+ uses native sidecar (initContainer with restartPolicy:Always)
 # on Kubernetes 1.28+; check both containers and initContainers.
@@ -329,9 +260,9 @@ echo "━━━━━━━━━━━━━━━━━━━━━━━━�
 if [[ "${FAIL}" -gt 0 ]]; then
   echo
   echo "  Resources left in namespace '${NS}' for investigation:"
-  echo "    kubectl get pods -A"
-  echo "    kubectl describe ingress echo -n ${NS}"
-  echo "    kubectl describe certificate echo-tls -n ${NS}"
+  echo "    kubectl get pods -n ${NS}"
+  echo "    kubectl get httproute echo -n ${NS} -o yaml"
+  echo "    kubectl get gateway gateway -n istio-system"
   echo "    kubectl get events -n ${NS} --sort-by=.lastTimestamp"
   echo
   echo "  Clean up manually: kubectl delete namespace ${NS}"

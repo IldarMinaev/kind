@@ -11,9 +11,6 @@ sudo systemctl enable --now docker
 sudo usermod -aG docker $USER   # log out/in after this
 ```
 
-> **istioctl** is downloaded automatically by `setup.sh` if not found.
-> To install it manually: `curl -sSL https://istio.io/downloadIstio | sh -`
-
 ---
 
 ## One-time DNS setup (wildcard *.localhost.localdomain)
@@ -56,22 +53,24 @@ The script is idempotent — safe to re-run.
 Host machine (Fedora)
   *.localhost.localdomain → 127.0.0.1
        │
-       └── :80 / :443  ──► kind node NodePort ──► Istio ingress gateway
-                            30080 / 30443          ├── HTTPRoute  (new apps, Gateway API)
-                                                   ├── Ingress    (old apps, ingressClassName: istio)
+       └── :80 / :443  ──► kind node NodePort ──► gateway-istio (istio-system)
+                            30080 / 30443          ├── HTTPRoute  (Gateway API)
+                                                   ├── Ingress    (ingressClassName: istio)
                                                    └── Gateway + VirtualService (Istio native)
 ```
 
-| Entry point        | Port on host  | Used for                                                        |
-|--------------------|---------------|-----------------------------------------------------------------|
-| Istio gateway      | 80 / **443**  | `HTTPRoute` · `Ingress` (className: istio) · `VirtualService`  |
-| Storage            | —             | `/var/local-path-provisioner`                                   |
+| Entry point                     | Port on host | Used for                                        |
+|---------------------------------|--------------|-------------------------------------------------|
+| `gateway-istio` (istio-system)  | 80 / **443** | `HTTPRoute` · `Ingress` · `VirtualService`      |
+| Storage                         | —            | `/var/local-path-provisioner`                   |
 
-The shared Gateway resource lives in `gateway-infra/gateway` and accepts
-HTTPRoutes from **any namespace** on both HTTP (:80) and HTTPS (:443).
+A single `istio-system/gateway` Gateway accepts HTTPRoutes from **any namespace**
+on HTTP (:80) and HTTPS (:443). TLS is terminated using the wildcard cert
+`istio-system/istio-gw-tls` (issued by `local-ca-issuer`).
 
-Old apps using `Ingress` resources work on the same port 443 — just set
-`ingressClassName: istio` (or `kubernetes.io/ingress.class: istio` annotation).
+Classic `Ingress` resources (`ingressClassName: istio`) and Istio-native
+`Gateway`+`VirtualService` are also served by the same `gateway-istio` pod
+(configured via `meshConfig.ingressService=gateway-istio` in Istiod).
 
 ---
 
@@ -92,7 +91,7 @@ metadata:
 spec:
   parentRefs:
     - name: gateway
-      namespace: gateway-infra
+      namespace: istio-system
   hostnames:
     - my-app.localhost.localdomain
   rules:
@@ -102,28 +101,27 @@ spec:
 ```
 
 Access: `https://my-app.localhost.localdomain` (HTTPS terminated at the Gateway
-using the wildcard cert `gateway-infra/gateway-wildcard-tls`).
+using the wildcard cert `istio-system/istio-gw-tls`).
 
 ---
 
-### Classic Ingress with automatic TLS (old apps)
+### Classic Ingress with automatic TLS
 
-Use `ingressClassName: istio` instead of `nginx`. The TLS secret is created by
-cert-manager in the same namespace and Istio reads it automatically.
+Use `ingressClassName: istio` instead of `nginx`. For HTTPS, reference the
+shared wildcard secret `istio-gw-tls` (in `istio-system`) in the `tls:` block —
+Istio reads it from there and terminates TLS for the matching hostname.
 
 ```yaml
 apiVersion: networking.k8s.io/v1
 kind: Ingress
 metadata:
   name: my-app
-  annotations:
-    cert-manager.io/cluster-issuer: local-ca-issuer
 spec:
   ingressClassName: istio
   tls:
     - hosts:
         - my-app.localhost.localdomain
-      secretName: my-app-tls
+      secretName: istio-gw-tls   # shared wildcard cert in istio-system
   rules:
     - host: my-app.localhost.localdomain
       http:
@@ -312,44 +310,30 @@ curl -s http://localhost:5001/v2/inventory-service/tags/list | jq
 
 ## Registry mirrors / Docker Hub proxy
 
-If your environment has no direct access to Docker Hub, configure mirrors in
-`kind-config.yaml` under `containerdConfigPatches`. The mirrors are baked into
-every node at cluster creation time — they require a **cluster recreation** to
-take effect.
+`setup.sh` writes containerd `hosts.toml` files directly into each node and
+restarts containerd — **no cluster recreation required**. Edit the `MIRRORS`
+array near the top of `setup.sh` and re-run:
 
-```yaml
-# kind-config.yaml (already present, edit the mirror list to suit your network)
-containerdConfigPatches:
-  - |-
-    [plugins."io.containerd.grpc.v1.cri".registry]
-      [plugins."io.containerd.grpc.v1.cri".registry.mirrors]
-        [plugins."io.containerd.grpc.v1.cri".registry.mirrors."docker.io"]
-          endpoint = [
-            "https://dockerhub.timeweb.cloud",
-            "https://dockerhub1.beget.com",
-            "https://mirror.gcr.io"
-          ]
-        [plugins."io.containerd.grpc.v1.cri".registry.mirrors."ghcr.io"]
-          endpoint = ["https://ghcr.io"]
-        [plugins."io.containerd.grpc.v1.cri".registry.mirrors."quay.io"]
-          endpoint = ["https://quay.io"]
-        [plugins."io.containerd.grpc.v1.cri".registry.mirrors."registry.k8s.io"]
-          endpoint = ["https://registry.k8s.io"]
+```bash
+# In setup.sh — edit and re-run to apply without recreating the cluster
+MIRRORS=(
+  "https://dockerhub.timeweb.cloud"
+  "https://dockerhub1.beget.com"
+  "https://mirror.gcr.io"
+)
+```
+
+```bash
+./setup.sh   # idempotent — reconfigures mirrors on the running cluster
 ```
 
 Mirrors are tried in order; the original registry is used as a fallback.
-
-To apply after editing:
-
-```bash
-./setup.sh --recreate
-```
 
 To verify mirrors are active on a running node:
 
 ```bash
 docker exec local-dev-control-plane \
-  cat /etc/containerd/config.toml | grep -A5 mirrors
+  cat /etc/containerd/certs.d/docker.io/hosts.toml
 ```
 
 ---
