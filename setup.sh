@@ -477,6 +477,12 @@ metadata:
   namespace: istio-system
 spec:
   gatewayClassName: istio
+  infrastructure:
+    labels:
+      # Istiod's Ingress controller selects gateway pods via {istio: <ingressService>}
+      # (hardcoded pattern, independent of the Service's actual pod selector).
+      # This label makes meshConfig.ingressService=gateway-istio work for classic Ingress.
+      istio: gateway-istio
   listeners:
     - name: https
       protocol: HTTPS
@@ -498,6 +504,39 @@ spec:
 EOF
 
 ok "Gateway 'istio-system/gateway' created (HTTPS :443, HTTP :80)"
+
+# The Gateway API deployment controller creates the gateway-istio pod with a
+# ServiceAccount that lacks permission to read K8s secrets.  But Istio's classic
+# Ingress controller generates TLS filter chains that use the 'kubernetes://'
+# SDS scheme, which requires the pod to read secrets directly via the K8s API.
+# Without this Role, classic Ingress TLS stays stuck in 'warming' and TLS
+# connections fail immediately (EOF after Client Hello).
+kubectl apply -f - <<'EOF'
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: gateway-istio-secret-reader
+  namespace: istio-system
+rules:
+  - apiGroups: [""]
+    resources: ["secrets"]
+    verbs: ["get", "watch", "list"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: gateway-istio-secret-reader
+  namespace: istio-system
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: Role
+  name: gateway-istio-secret-reader
+subjects:
+  - kind: ServiceAccount
+    name: gateway-istio
+    namespace: istio-system
+EOF
+ok "gateway-istio ServiceAccount granted secrets read access (for Ingress TLS)"
 
 # ── Patch gateway-istio Service to fixed NodePorts ────────────────────────
 #
