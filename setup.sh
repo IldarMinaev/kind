@@ -50,6 +50,16 @@ wait_for_rollout() {
   kubectl rollout status deployment/"${deploy}" -n "${ns}" --timeout=5m
 }
 
+# Apply a remote manifest without going through the host proxy.
+# kubectl uses Go's HTTP client which respects http_proxy/https_proxy; if
+# those point at a corporate proxy that blocks GitHub, the download fails.
+# Unsetting them here ensures direct access to public URLs.
+kubectl_apply_url() {
+  env -u http_proxy -u HTTP_PROXY -u https_proxy -u HTTPS_PROXY \
+      -u all_proxy  -u ALL_PROXY \
+    kubectl apply -f "$1"
+}
+
 # ── prerequisites ──────────────────────────────────────────────────────────
 
 log "Checking prerequisites"
@@ -291,7 +301,7 @@ ok "local-path-provisioner configured (storage root: ${STORAGE_ROOT})"
 
 # ── nginx ingress controller ───────────────────────────────────────────────
 log "Installing ServiceMonitor CRD"
-kubectl apply -f https://github.com/Netcracker/qubership-monitoring-operator/raw/refs/heads/main/charts/qubership-monitoring-crds/crds/monitoring.coreos.com_servicemonitors.yaml
+kubectl_apply_url https://github.com/Netcracker/qubership-monitoring-operator/raw/refs/heads/main/charts/qubership-monitoring-crds/crds/monitoring.coreos.com_servicemonitors.yaml
 
 # ── cert-manager ───────────────────────────────────────────────────────────
 
@@ -365,7 +375,7 @@ done
 
 log "Installing Kubernetes Gateway API CRDs ${GATEWAY_API_VERSION}"
 
-kubectl apply -f "https://github.com/kubernetes-sigs/gateway-api/releases/download/${GATEWAY_API_VERSION}/standard-install.yaml"
+kubectl_apply_url "https://github.com/kubernetes-sigs/gateway-api/releases/download/${GATEWAY_API_VERSION}/standard-install.yaml"
 
 ok "Gateway API CRDs installed"
 
