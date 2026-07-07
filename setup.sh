@@ -21,9 +21,9 @@ KIND_CONFIG="${SCRIPT_DIR}/kind-config.yaml"
 CLUSTER_NAME="local-dev"
 LOCAL_REGISTRY_NAME="kind-registry"
 LOCAL_REGISTRY_PORT="5001"   # port on the host; inside kind nodes use kind-registry:5000
-ISTIO_VERSION="1.23.3"
-GATEWAY_API_VERSION="v1.2.1"
-CERT_MANAGER_VERSION="v1.16.2"
+ISTIO_VERSION="1.30.2"
+GATEWAY_API_VERSION="v1.5.1"
+CERT_MANAGER_VERSION="v1.20.3"
 STORAGE_ROOT="/var/local-path-provisioner"
 
 RECREATE=false
@@ -48,6 +48,23 @@ require() {
 wait_for_rollout() {
   local ns="$1" deploy="$2"
   kubectl rollout status deployment/"${deploy}" -n "${ns}" --timeout=5m
+}
+
+helm_release_status() {
+  local release="$1" ns="$2"
+  helm status "${release}" -n "${ns}" 2>/dev/null | awk -F': ' '/^STATUS:/ {print $2; exit}' || true
+}
+
+clear_unhealthy_helm_release() {
+  local release="$1" ns="$2" status
+  status="$(helm_release_status "${release}" "${ns}")"
+
+  case "${status}" in
+    failed|pending-install|pending-upgrade|pending-rollback)
+      warn "Helm release '${release}' is stuck in ${status}; uninstalling it before retry"
+      helm uninstall "${release}" -n "${ns}" || true
+      ;;
+  esac
 }
 
 # Apply a remote manifest without going through the host proxy.
@@ -310,12 +327,22 @@ log "Installing cert-manager ${CERT_MANAGER_VERSION}"
 helm repo add jetstack https://charts.jetstack.io --force-update 2>/dev/null || true
 helm repo update jetstack
 
+clear_unhealthy_helm_release cert-manager cert-manager
+
+if kubectl get namespace cert-manager &>/dev/null; then
+  kubectl delete job cert-manager-startupapicheck -n cert-manager --ignore-not-found
+fi
+
 helm upgrade --install cert-manager jetstack/cert-manager \
   --namespace cert-manager \
   --create-namespace \
   --version "${CERT_MANAGER_VERSION}" \
   --set crds.enabled=true \
-  --wait --timeout 5m
+  --set startupapicheck.enabled=false
+
+wait_for_rollout cert-manager cert-manager
+wait_for_rollout cert-manager cert-manager-cainjector
+wait_for_rollout cert-manager cert-manager-webhook
 
 ok "cert-manager installed"
 
