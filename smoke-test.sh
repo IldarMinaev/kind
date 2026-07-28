@@ -9,6 +9,7 @@
 #   4. Classic Kubernetes Ingress — HTTP (port 80)
 #   5. PersistentVolumeClaim provisioning (local-path)
 #   6. Istio sidecar injection
+#   7. Metrics Server API and node resource metrics
 #
 # Run:
 #   ./smoke-test.sh
@@ -287,6 +288,58 @@ else
   fail "istio-proxy NOT found in pod (containers: [${ALL_CONTAINERS}])"
 fi
 
+# ── 7. Metrics Server ──────────────────────────────────────────────────────
+
+log "7. Metrics Server API and node resource metrics"
+
+if kubectl wait --for=condition=Available apiservice/v1beta1.metrics.k8s.io --timeout=3m >/dev/null; then
+  pass "Metrics APIService is Available"
+else
+  fail "Metrics APIService did not become Available"
+  kubectl describe apiservice v1beta1.metrics.k8s.io >&2 || true
+  kubectl get pods -n kube-system -l k8s-app=metrics-server -o wide >&2 || true
+  kubectl logs deployment/metrics-server -n kube-system --all-containers --tail=100 >&2 || true
+fi
+
+READY_NODES=$(kubectl get nodes \
+  -o 'custom-columns=NAME:.metadata.name,READY:.status.conditions[?(@.type=="Ready")].status' \
+  --no-headers 2>/dev/null | awk '$2 == "True" {print $1}')
+METRICS_OUTPUT=""
+METRICS_COMMAND_SUCCEEDED=false
+for i in $(seq 1 30); do
+  if METRICS_OUTPUT=$(kubectl top nodes 2>&1); then
+    METRICS_COMMAND_SUCCEEDED=true
+    break
+  fi
+  sleep 2
+done
+
+if [[ -z "${READY_NODES}" ]]; then
+  fail "No Ready nodes found while checking Metrics Server"
+elif [[ "${METRICS_COMMAND_SUCCEEDED}" != "true" ]]; then
+  fail "kubectl top nodes did not return metrics after retries: ${METRICS_OUTPUT}"
+  kubectl describe apiservice v1beta1.metrics.k8s.io >&2 || true
+  kubectl get pods -n kube-system -l k8s-app=metrics-server -o wide >&2 || true
+  kubectl logs deployment/metrics-server -n kube-system --all-containers --tail=100 >&2 || true
+else
+  MISSING_METRICS_NODES=""
+  for node in ${READY_NODES}; do
+    if ! printf '%s\n' "${METRICS_OUTPUT}" | awk 'NR > 1 {print $1}' | grep -Fxq "${node}"; then
+      MISSING_METRICS_NODES+=" ${node}"
+    fi
+  done
+
+  if [[ -z "${MISSING_METRICS_NODES}" ]]; then
+    pass "kubectl top nodes reports metrics for every Ready node"
+  else
+    fail "kubectl top nodes is missing metrics for Ready node(s):${MISSING_METRICS_NODES}"
+    printf '%s\n' "${METRICS_OUTPUT}" >&2
+    kubectl get nodes -o wide >&2 || true
+    kubectl get pods -n kube-system -l k8s-app=metrics-server -o wide >&2 || true
+    kubectl logs deployment/metrics-server -n kube-system --all-containers --tail=100 >&2 || true
+  fi
+fi
+
 # ── summary ────────────────────────────────────────────────────────────────
 
 echo
@@ -301,6 +354,8 @@ if [[ "${FAIL}" -gt 0 ]]; then
   echo "    kubectl get httproute echo -n ${NS} -o yaml"
   echo "    kubectl get ingress ingress-echo -n ${NS} -o yaml"
   echo "    kubectl get gateway gateway -n istio-system"
+  echo "    kubectl describe apiservice v1beta1.metrics.k8s.io"
+  echo "    kubectl logs deployment/metrics-server -n kube-system --all-containers --tail=100"
   echo "    kubectl get events -n ${NS} --sort-by=.lastTimestamp"
   echo
   echo "  Clean up manually: kubectl delete namespace ${NS}"

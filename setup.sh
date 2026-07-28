@@ -6,6 +6,7 @@
 #     (set ingressClassName: istio on Ingress objects)
 #   - cert-manager with a self-signed ClusterIssuer
 #   - local-path-provisioner for persistent host storage
+#   - Metrics Server for Kubernetes resource metrics
 #   - DNS wildcard *.localhost.localdomain → 127.0.0.1 via NetworkManager/dnsmasq
 #   - local Docker registry  (localhost:5001, accessible as kind-registry:5000)
 #
@@ -24,6 +25,7 @@ LOCAL_REGISTRY_PORT="5001"   # port on the host; inside kind nodes use kind-regi
 ISTIO_VERSION="1.30.2"
 GATEWAY_API_VERSION="v1.5.1"
 CERT_MANAGER_VERSION="v1.20.3"
+METRICS_SERVER_VERSION="v0.9.0"
 STORAGE_ROOT="/var/local-path-provisioner"
 
 RECREATE=false
@@ -519,6 +521,42 @@ fi
 
 ok "local-path-provisioner configured (storage root: ${STORAGE_ROOT})"
 
+# ── Metrics Server ─────────────────────────────────────────────────────────
+
+log "Installing Metrics Server ${METRICS_SERVER_VERSION}"
+
+kubectl_apply_url "https://github.com/kubernetes-sigs/metrics-server/releases/download/${METRICS_SERVER_VERSION}/components.yaml"
+
+# Kind kubelets use certificates that Metrics Server cannot verify with the
+# default cluster trust. This flag is for this local development cluster only.
+# Keep the official v0.9.0 arguments intact and replace the complete list on
+# every run, so --kubelet-insecure-tls is never duplicated.
+kubectl patch deployment metrics-server -n kube-system --type=strategic -p='{
+  "spec": {
+    "template": {
+      "spec": {
+        "containers": [
+          {
+            "name": "metrics-server",
+            "args": [
+              "--cert-dir=/tmp",
+              "--secure-port=10250",
+              "--kubelet-preferred-address-types=InternalIP,ExternalIP,Hostname",
+              "--kubelet-use-node-status-port",
+              "--metric-resolution=15s",
+              "--kubelet-insecure-tls"
+            ]
+          }
+        ]
+      }
+    }
+  }
+}'
+
+wait_for_rollout kube-system metrics-server
+kubectl wait --for=condition=Available apiservice/v1beta1.metrics.k8s.io --timeout=5m
+ok "Metrics Server installed (v1beta1.metrics.k8s.io Available)"
+
 # ── nginx ingress controller ───────────────────────────────────────────────
 log "Installing ServiceMonitor CRD"
 kubectl_apply_url https://github.com/Netcracker/qubership-monitoring-operator/raw/refs/heads/main/charts/qubership-monitoring-crds/crds/monitoring.coreos.com_servicemonitors.yaml
@@ -835,8 +873,12 @@ check_deployment() {
 check_deployment local-path-storage   local-path-provisioner
 check_deployment cert-manager         cert-manager
 check_deployment cert-manager         cert-manager-webhook
+check_deployment kube-system          metrics-server
 check_deployment istio-system         istiod
 check_deployment istio-system         gateway-istio
+kubectl get apiservice v1beta1.metrics.k8s.io \
+  -o 'custom-columns=COMPONENT:.metadata.name,AVAILABLE:.status.conditions[?(@.type=="Available")].status' \
+  --no-headers
 
 echo
 kubectl get storageclass
@@ -873,6 +915,10 @@ cat <<SUMMARY
   Storage:
     StorageClass : local-path (default)
     Host path    : ${STORAGE_ROOT}
+
+  Resource metrics (local development only):
+    kubectl top nodes
+    kubectl top pods -A
 
   Re-run modes:
     ./setup.sh             — upgrade components in-place

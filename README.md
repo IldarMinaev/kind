@@ -47,6 +47,28 @@ The script is idempotent — safe to re-run.
 
 ---
 
+## Resource metrics with Metrics Server
+
+`setup.sh` installs the official [Metrics Server v0.9.0 components](https://github.com/kubernetes-sigs/metrics-server/releases/download/v0.9.0/components.yaml).
+It adds `--kubelet-insecure-tls` only because local Kind kubelets use certificates that Metrics Server cannot verify
+with the default cluster trust. Do not use this flag in production, where you must configure trusted kubelet TLS.
+
+Metrics Server provides short-lived resource metrics for Horizontal Pod Autoscaler decisions and resource debugging.
+Metrics Server is not a monitoring system or durable metrics store. Use Prometheus or VictoriaMetrics for durable
+metrics, queries, alerting, and dashboards.
+
+```bash
+# Inspect resource usage after setup completes
+kubectl top nodes
+kubectl top pods -A
+
+# Verify the aggregated metrics API and Metrics Server workload
+kubectl get apiservice v1beta1.metrics.k8s.io
+kubectl rollout status deployment/metrics-server -n kube-system
+```
+
+---
+
 ## Architecture
 
 ```
@@ -399,5 +421,6 @@ docker exec local-dev-control-plane \
 | Ingress not routing | Confirm `ingressClassName: istio` is set (not `nginx`) |
 | Istio pods pending | Ensure worker nodes have enough resources (4 CPU / 8 GB RAM recommended) |
 | TLS cert not issued | `kubectl describe certificaterequest -A` and check cert-manager logs |
+| `kubectl top` reports no metrics | `kubectl describe apiservice v1beta1.metrics.k8s.io`, then `kubectl logs deployment/metrics-server -n kube-system --all-containers --tail=100` |
 | ImagePullBackOff (public image) | Add/update mirrors in `kind-config.yaml`, then `./setup.sh --recreate` |
 | ImagePullBackOff (local image) | `./kbuild <image>:<tag> <context>`, use `localhost:5001/…` in pod spec |
