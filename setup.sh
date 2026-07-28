@@ -603,6 +603,7 @@ kubectl patch svc gateway-istio -n istio-system --type=json -p='[
     {"name":"https",      "port":443,  "targetPort":443,  "nodePort":30443,"protocol":"TCP"}
   ]}
 ]'
+wait_for_rollout istio-system gateway-istio
 ok "gateway-istio → NodePort 30080 (HTTP→host:80) / 30443 (HTTPS→host:443)"
 
 # ── Verify ────────────────────────────────────────────────────────────────
@@ -655,7 +656,7 @@ cat <<SUMMARY
 
   Classic Ingress (set ingressClassName: istio):
     HTTP   →  http://<name>.localhost.localdomain
-    HTTPS  →  https://<name>.localhost.localdomain (add tls: + secretName: istio-gw-tls)
+    HTTPS  →  https://<name>.localhost.localdomain (use a namespace-local TLS secret)
 
   Istio Gateway + VirtualService (Istio native):
     HTTP   →  http://<name>.localhost.localdomain

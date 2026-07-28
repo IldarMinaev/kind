@@ -105,11 +105,11 @@ using the wildcard cert `istio-system/istio-gw-tls`).
 
 ---
 
-### Classic Ingress with automatic TLS
+### Classic Ingress over HTTP
 
-Use `ingressClassName: istio` instead of `nginx`. For HTTPS, reference the
-shared wildcard secret `istio-gw-tls` (in `istio-system`) in the `tls:` block —
-Istio reads it from there and terminates TLS for the matching hostname.
+Use `ingressClassName: istio` for classic Kubernetes Ingress resources. This
+routes HTTP traffic through the same `gateway-istio` pod that serves Gateway API
+routes.
 
 ```yaml
 apiVersion: networking.k8s.io/v1
@@ -118,10 +118,6 @@ metadata:
   name: my-app
 spec:
   ingressClassName: istio
-  tls:
-    - hosts:
-        - my-app.localhost.localdomain
-      secretName: istio-gw-tls   # shared wildcard cert in istio-system
   rules:
     - host: my-app.localhost.localdomain
       http:
@@ -135,7 +131,63 @@ spec:
                   number: 80
 ```
 
-Access: `https://my-app.localhost.localdomain`
+Access: `http://my-app.localhost.localdomain`
+
+### Classic Ingress with namespace-local TLS
+
+Gateway API `HTTPRoute` is the recommended HTTPS path because it uses the shared
+`istio-system/gateway` and wildcard certificate created by `setup.sh`.
+
+For classic Ingress HTTPS, `spec.tls[].secretName` is a namespace-local
+Kubernetes reference. The TLS secret must exist in the same namespace as the
+Ingress. Setting only `tls.hosts` is not enough; Istio creates an HTTPS route
+only when `secretName` is set.
+
+Create a namespace-local certificate or TLS secret for the application, then
+reference that secret from the Ingress:
+
+```yaml
+apiVersion: cert-manager.io/v1
+kind: Certificate
+metadata:
+  name: my-app-tls
+  namespace: my-namespace
+spec:
+  secretName: my-app-tls
+  dnsNames:
+    - my-app.localhost.localdomain
+  issuerRef:
+    name: local-ca-issuer
+    kind: ClusterIssuer
+    group: cert-manager.io
+---
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: my-app
+  namespace: my-namespace
+spec:
+  ingressClassName: istio
+  tls:
+    - hosts:
+        - my-app.localhost.localdomain
+      secretName: my-app-tls
+  rules:
+    - host: my-app.localhost.localdomain
+      http:
+        paths:
+          - path: /
+            pathType: Prefix
+            backend:
+              service:
+                name: my-app-svc
+                port:
+                  number: 80
+```
+
+Do not reference `istio-system/istio-gw-tls` from an Ingress in an application
+namespace. Kubernetes Ingress does not support cross-namespace TLS secret
+references.
 
 ---
 

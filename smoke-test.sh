@@ -6,8 +6,9 @@
 #   1. DNS wildcard resolution
 #   2. Gateway API HTTPRoute — HTTP  (port 80)
 #   3. Gateway API HTTPRoute — HTTPS (port 443, wildcard TLS)
-#   4. PersistentVolumeClaim provisioning (local-path)
-#   5. Istio sidecar injection
+#   4. Classic Kubernetes Ingress — HTTP (port 80)
+#   5. PersistentVolumeClaim provisioning (local-path)
+#   6. Istio sidecar injection
 #
 # Run:
 #   ./smoke-test.sh
@@ -117,6 +118,25 @@ spec:
         - name: echo
           port: 80
 ---
+# Classic Kubernetes Ingress — HTTP through Istio's ingress controller
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: ingress-echo
+spec:
+  ingressClassName: istio
+  rules:
+    - host: ingress-echo.localhost.localdomain
+      http:
+        paths:
+          - path: /
+            pathType: Prefix
+            backend:
+              service:
+                name: echo
+                port:
+                  number: 80
+---
 # PVC
 apiVersion: v1
 kind: PersistentVolumeClaim
@@ -191,9 +211,26 @@ else
   fail "HTTPS body unexpected after retries: '${HTTPS_BODY}'"
 fi
 
-# ── 4. PVC provisioning ────────────────────────────────────────────────────
+# ── 4. Classic Kubernetes Ingress — HTTP ───────────────────────────────────
 
-log "4. PersistentVolumeClaim — local-path provisioner"
+log "4. Classic Kubernetes Ingress — HTTP (port 80)"
+
+INGRESS_BODY=""
+for i in $(seq 1 30); do
+  INGRESS_BODY=$(kcurl -s -4 --max-time 3 http://ingress-echo.localhost.localdomain/ 2>/dev/null || echo "")
+  [[ "${INGRESS_BODY}" == *"hello-from-kind"* ]] && break
+  sleep 2
+done
+
+if [[ "${INGRESS_BODY}" == *"hello-from-kind"* ]]; then
+  pass "Ingress HTTP → 'hello-from-kind'"
+else
+  fail "Ingress HTTP body unexpected after retries: '${INGRESS_BODY}'"
+fi
+
+# ── 5. PVC provisioning ────────────────────────────────────────────────────
+
+log "5. PersistentVolumeClaim — local-path provisioner"
 
 kubectl apply -n "${NS}" -f - >/dev/null <<'EOF'
 apiVersion: v1
@@ -235,9 +272,9 @@ else
   fail "PVC not bound after 60s (status: ${PVC_STATUS})"
 fi
 
-# ── 5. Istio sidecar injection ─────────────────────────────────────────────
+# ── 6. Istio sidecar injection ─────────────────────────────────────────────
 
-log "5. Istio sidecar injection"
+log "6. Istio sidecar injection"
 
 # Istio 1.23+ uses native sidecar (initContainer with restartPolicy:Always)
 # on Kubernetes 1.28+; check both containers and initContainers.
@@ -262,6 +299,7 @@ if [[ "${FAIL}" -gt 0 ]]; then
   echo "  Resources left in namespace '${NS}' for investigation:"
   echo "    kubectl get pods -n ${NS}"
   echo "    kubectl get httproute echo -n ${NS} -o yaml"
+  echo "    kubectl get ingress ingress-echo -n ${NS} -o yaml"
   echo "    kubectl get gateway gateway -n istio-system"
   echo "    kubectl get events -n ${NS} --sort-by=.lastTimestamp"
   echo

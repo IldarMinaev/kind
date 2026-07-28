@@ -5,6 +5,13 @@ name: local-dev
 networking:
   apiServerAddress: "127.0.0.1"
 
+kubeadmConfigPatches:
+  - |
+    kind: ClusterConfiguration
+    apiServer:
+      extraArgs:
+        enable-admission-plugins: NodeRestriction,OwnerReferencesPermissionEnforcement
+
 # Registry mirrors are configured by setup.sh via 'docker exec' after cluster
 # creation (containerd v2 hosts.toml approach) — see setup.sh configure_mirrors().
 
