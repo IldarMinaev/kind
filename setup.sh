@@ -135,6 +135,209 @@ fi
 
 kubectl config use-context "kind-${CLUSTER_NAME}"
 
+# ── etcd certificate repair ────────────────────────────────────────────────
+#
+# Docker may assign a new IP address to an existing kind control-plane node.
+# kubeadm records the new address in /kind/kubeadm.conf, but the existing etcd
+# server and peer certificates retain the old address and then reject clients.
+
+etcd_certificate_has_ip() {
+  local node="$1" certificate="$2" ip="$3" sans
+  docker exec "${node}" openssl x509 -in "${certificate}" -noout -checkip "${ip}" >/dev/null
+}
+
+backup_etcd_certificates() {
+  local node="$1" backup_dir="$2"
+  shift 2
+
+  docker exec "${node}" bash -ceu '
+    backup_dir="$1"
+    shift
+    cleanup_incomplete_backup() {
+      rm -rf "${backup_dir}"
+    }
+    trap cleanup_incomplete_backup ERR
+
+    for certificate in "$@"; do
+      for extension in crt key; do
+        source="/etc/kubernetes/pki/etcd/${certificate}.${extension}"
+        test -f "${source}"
+      done
+    done
+    for certificate in "$@"; do
+      for extension in crt key; do
+        source="/etc/kubernetes/pki/etcd/${certificate}.${extension}"
+        backup="${backup_dir}/${certificate}.${extension}"
+        cp -p "${source}" "${backup}"
+        cmp -s "${source}" "${backup}"
+      done
+    done
+    trap - ERR
+  ' bash "${backup_dir}" "$@"
+}
+
+restore_etcd_certificates() {
+  local node="$1" backup_dir="$2"
+  shift 2
+
+  docker exec "${node}" bash -ceu '
+    backup_dir="$1"
+    shift
+    for certificate in "$@"; do
+      for extension in crt key; do
+        test -f "${backup_dir}/${certificate}.${extension}"
+      done
+    done
+    for certificate in "$@"; do
+      for extension in crt key; do
+        mv -f "${backup_dir}/${certificate}.${extension}" \
+          "/etc/kubernetes/pki/etcd/${certificate}.${extension}"
+      done
+    done
+    rmdir "${backup_dir}"
+  ' bash "${backup_dir}" "$@"
+}
+
+remove_etcd_certificates() {
+  local node="$1"
+  shift
+
+  docker exec "${node}" bash -ceu '
+    for certificate in "$@"; do
+      rm -f "/etc/kubernetes/pki/etcd/${certificate}.crt" \
+        "/etc/kubernetes/pki/etcd/${certificate}.key"
+    done
+  ' bash "$@"
+}
+
+discard_etcd_certificate_backup() {
+  local node="$1" backup_dir="$2"
+  shift 2
+
+  docker exec "${node}" bash -ceu '
+    backup_dir="$1"
+    shift
+    for certificate in "$@"; do
+      rm -f "${backup_dir}/${certificate}.crt" "${backup_dir}/${certificate}.key"
+    done
+    rmdir "${backup_dir}"
+  ' bash "${backup_dir}" "$@"
+}
+
+restart_static_etcd() {
+  local node="$1" container_id
+  container_id="$(docker exec "${node}" crictl ps --name etcd -q)"
+  [[ -n "${container_id}" ]] || return 1
+  docker exec "${node}" crictl stop "${container_id}" >/dev/null
+}
+
+wait_for_etcd_and_kubernetes() {
+  local node="$1" i
+  local pod="etcd-${node}"
+
+  for i in $(seq 1 90); do
+    if docker exec "${node}" curl -fsS http://127.0.0.1:2381/readyz >/dev/null 2>&1 \
+      && kubectl get --raw=/readyz >/dev/null 2>&1 \
+      && [[ "$(kubectl get pod "${pod}" -n kube-system \
+          -o jsonpath='{.status.conditions[?(@.type=="Ready")].status}' 2>/dev/null)" == "True" ]]; then
+      return 0
+    fi
+    sleep 2
+  done
+
+  return 1
+}
+
+repair_stale_etcd_certificates() {
+  local node="${CLUSTER_NAME}-control-plane" ip backup_dir
+  local -a stale_certificates=()
+  local rotate_server=false rotate_peer=false rollback_armed=false
+  local restart_attempted=false restart_completed=false
+
+  rollback_etcd_certificate_transaction() {
+    local status="$1"
+    trap - ERR INT TERM EXIT
+    if [[ "${rollback_armed}" == "true" ]]; then
+      rollback_armed=false
+      if restore_etcd_certificates "${node}" "${backup_dir}" "${stale_certificates[@]}"; then
+        if [[ "${restart_attempted}" == "true" ]]; then
+          restart_static_etcd "${node}" || true
+          if ! wait_for_etcd_and_kubernetes "${node}"; then
+            if [[ "${restart_completed}" == "true" ]]; then
+              warn "etcd did not recover after restoring original certificate pair(s) from a completed restart"
+            else
+              warn "etcd did not recover after restoring original certificate pair(s) during restart"
+            fi
+          fi
+        else
+          warn "etcd certificate rotation failed; original certificate pair(s) restored"
+        fi
+      else
+        warn "etcd certificate rotation failed and original certificate restoration also failed"
+      fi
+    fi
+    return "${status}"
+  }
+
+  ip="$(docker inspect -f '{{with index .NetworkSettings.Networks "kind"}}{{.IPAddress}}{{end}}' "${node}")"
+  [[ -n "${ip}" ]] || die "Unable to determine Docker IP for ${node}"
+
+  if ! etcd_certificate_has_ip "${node}" /etc/kubernetes/pki/etcd/server.crt "${ip}"; then
+    stale_certificates+=(server)
+    rotate_server=true
+  fi
+  if ! etcd_certificate_has_ip "${node}" /etc/kubernetes/pki/etcd/peer.crt "${ip}"; then
+    stale_certificates+=(peer)
+    rotate_peer=true
+  fi
+
+  if [[ "${#stale_certificates[@]}" -eq 0 ]]; then
+    ok "etcd server and peer certificate SANs include Docker IP ${ip}"
+    return
+  fi
+
+  docker exec "${node}" test -s /kind/kubeadm.conf \
+    || die "${node} has no current /kind/kubeadm.conf for etcd certificate repair"
+
+  warn "Rotating stale etcd ${stale_certificates[*]} certificate pair(s) for Docker IP ${ip}"
+  backup_dir="$(docker exec "${node}" mktemp -d /etc/kubernetes/pki/etcd/.setup-etcd-cert-backup.XXXXXX)"
+  backup_etcd_certificates "${node}" "${backup_dir}" "${stale_certificates[@]}"
+
+  rollback_armed=true
+  trap 'rollback_etcd_certificate_transaction "$?"; exit 1' ERR
+  trap 'rollback_etcd_certificate_transaction "$?"; exit 130' INT
+  trap 'rollback_etcd_certificate_transaction "$?"; exit 143' TERM
+  trap 'rollback_etcd_certificate_transaction "$?"' EXIT
+
+  remove_etcd_certificates "${node}" "${stale_certificates[@]}"
+
+  if [[ "${rotate_server}" == "true" ]]; then
+    docker exec "${node}" kubeadm init phase certs etcd-server --config /kind/kubeadm.conf
+  fi
+  if [[ "${rotate_peer}" == "true" ]]; then
+    docker exec "${node}" kubeadm init phase certs etcd-peer --config /kind/kubeadm.conf
+  fi
+
+  for certificate in "${stale_certificates[@]}"; do
+    etcd_certificate_has_ip "${node}" "/etc/kubernetes/pki/etcd/${certificate}.crt" "${ip}"
+  done
+
+  restart_attempted=true
+  restart_static_etcd "${node}"
+  restart_completed=true
+  wait_for_etcd_and_kubernetes "${node}"
+
+  rollback_armed=false
+  trap - ERR INT TERM EXIT
+  if ! discard_etcd_certificate_backup "${node}" "${backup_dir}" "${stale_certificates[@]}"; then
+    warn "Could not discard etcd certificate backup at ${backup_dir}; remove it manually after verifying the cluster"
+  fi
+  ok "etcd server and peer certificate SANs repaired for Docker IP ${ip}"
+}
+
+log "Checking etcd certificate SANs"
+repair_stale_etcd_certificates
+
 # ── Local Docker registry ──────────────────────────────────────────────────
 #
 # Run a registry:2 container on the kind Docker network so all cluster nodes
