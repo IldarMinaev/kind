@@ -261,7 +261,7 @@ done
 
 if [[ "${PVC_STATUS}" == "Bound" ]]; then
   pass "PVC bound (local-path → /var/local-path-provisioner)"
-  kubectl wait pod/pvc-checker -n "${NS}" --for=condition=Ready --timeout=60s >/dev/null 2>&1 || true
+  kubectl wait pod/pvc-checker -n "${NS}" --for=jsonpath='{.status.phase}'=Succeeded --timeout=60s >/dev/null 2>&1 || true
   PVC_DATA=$(kubectl logs pvc-checker -n "${NS}" 2>/dev/null || echo "")
   if [[ "${PVC_DATA}" == *"kind-pvc-ok"* ]]; then
     pass "Pod wrote and read data from PVC"
